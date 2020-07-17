@@ -9,20 +9,22 @@
 #include <assert.h>
 #include <unistd.h>
 #include <stdint.h>
-
+#include <math.h>
+#include <opencv2/opencv.hpp>
 int     memfd;
 void    *mapped_reg_base;
 void    *mapped_ddr_base;
 void    *mapped_inst_base;
 void    *mapped_weight_base;
 
-char    data_path[]     = "./param/vggnet_512_inst/ddr.imgs.in.rtl.bin";
-char    instr_path[]    = "./param/vggnet_512_inst/inst.rtl.bin";
-char    weights_path[]  = "./param/vggnet_512_inst/ddr.weights.rtl.bin";
-char    out_path[]      = "./param/vggnet_512_inst/outdata.bin";
-char    golden_path[]   = "./param/vggnet_512_inst/ddr.imgs.out.rtl.bin";
+//char    data_path[]     = "./param/vo/ddr.imgs.in.rtl.bin";
+char    instr_path[]    = "./param/vo/inst.rtl.bin";
+char    weights_path[]  = "./param/vo/ddr.weights.rtl.bin";
+//char    out_path[]      = "./param/vo/outdata.bin";
+//char    golden_path[]   = "./param/vo/ddr.imgs.out.rtl.bin";
 
-#define OUT_DATA_OFFSET 0x24c00
+#define OUT_DATA_OFFSET 2945536
+#define OUT_DATA_SIZE 84
 
 #undef readl
 #define readl(addr) \
@@ -130,7 +132,7 @@ int dump(char *path, void* from) // legacy
 int init_fpga(){
 
     printf("start loading bin file\n");
-    load_bin(data_path,    mapped_ddr_base);
+    //load_bin(data_path,    mapped_ddr_base);
     load_bin(weights_path, mapped_weight_base);
     load_bin(instr_path,   mapped_inst_base);
     printf("finish loading bin file\n");
@@ -156,12 +158,75 @@ int init_fpga(){
     writel(mapped_reg_base+0x08,INST_BASE_ADDRESS);
     writel(mapped_reg_base+0x0c,DDR_BASE_ADDRESS);
     writel(mapped_reg_base+0x10,WEIGHT_BASE_ADDRESS);
-    writel(mapped_reg_base+0x14,0);
-    usleep(1000);
-    writel(mapped_reg_base+0x14,1);
+    //writel(mapped_reg_base+0x14,0);
+    //usleep(1000);
+    //writel(mapped_reg_base+0x14,1);
     printf("finish configuring dpu registers\n");
     ////// WAIT //////
 	return 0;
+}
+
+int run(){
+    writel(mapped_reg_base+0x14,0);
+    usleep(1000);
+    writel(mapped_reg_base+0x14,1);
+    return 0;
+}
+
+void dpuSetInputImage2(const char *img_path1, const char *img_path2, int8_t *img_addr, int height, int width) {
+    cv::Mat img1 = cv::imread(img_path1), img_res1;
+    img_res1 = cv::Mat(height, width, CV_8SC3);
+    if(img1.rows != width){
+        cv::resize(img1, img_res1, cv::Size(height, width),0,0,cv::INTER_LINEAR);
+    }else{
+        img_res1 = img1;
+    }
+    
+    cv::Mat img2 = cv::imread(img_path2), img_res2;
+    img_res2 = cv::Mat(height, width, CV_8SC3);
+    if(img2.rows != width){
+        cv::resize(img2, img_res2, cv::Size(height, width),0,0,cv::INTER_LINEAR);
+    }else{
+        img_res2 = img2;
+    }
+    /*
+    for(int i_w = 0; i_w<3; i_w++){
+      for(int i = 0; i<3; i++){
+        cout << "ori img =" << (float)img.at<Vec3b>(0,i_w)[i] << endl;
+        cout << "resize img = " << (float)img_res.at<Vec3b>(0,i_w)[i] << endl;
+      }
+    }
+    for(int i = 0; i<3; i++){
+      cout << "1314 resize img = " << (float)img_res.at<Vec3b>(438, 0)[i] << endl;
+    }
+    */
+    int8_t *addr = img_addr;
+    
+    float scale = 0.00390625f;
+    int value;
+    float mean[3] = {128, 128, 128};
+    float temp;
+    int count = 0;
+    for(int i_h = 0; i_h < img_res1.rows; i_h++){
+        for(int i_w = 0; i_w < img_res1.cols; i_w++){
+            for(int i_c = 0; i_c < 3 ; i_c++){
+                temp = ((float)img_res1.at<Vec3b>(i_h,i_w)[2-i_c] - mean[2-i_c])*scale;
+                value = (int)round(temp*128);
+                *(addr++) = (int8_t)value;
+            }
+            for(int i_c = 0; i_c < 3 ; i_c++){
+                temp = ((float)img_res2.at<Vec3b>(i_h,i_w)[2-i_c] - mean[2-i_c])*scale;
+                value = (int)round(temp*128);
+                *(addr++) = (int8_t)value;
+            }
+        }
+    }
+}
+
+void dpuGetResultFrom(int8_t *to, int8_t *from, int size){
+    for(int i = 0; i < size; ++i){
+        to[i] = *(from+i);
+    }
 }
 
 int main(){
@@ -185,21 +250,39 @@ int main(){
   init_fpga();
   printf("finish initing dpu\n\n");
 
-  
-   rc = clock_gettime(CLOCK_MONOTONIC, &ts_start);
-   while (!(readl(mapped_reg_base + 0x14) & 0x2)){
+  int num = 1591;
+  char img1[50];
+  char img2[50];
+  char output[OUT_DATA_SIZE];
+  FILE *outfile = fopen("out_data.txt", "w");
+  for(int i = 0; i < num-1; ++i){
+    sprintf(img1, "dataset/kitti_09_image_2/%06d.png", i);
+    sprintf(img2, "dataset/kitti_09_image_2/%06d.png", i+1);
+    dpuSetImage2(img1, img2, mapped_ddr_base, 256, 832);
+    run();
+    rc = clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    while (!(readl(mapped_reg_base + 0x14) & 0x2)){
         usleep(1);
-   }
-   rc = clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    }
+    rc = clock_gettime(CLOCK_MONOTONIC, &ts_end);
 
-   timespec_sub(&ts_end, &ts_start);
-   printf("CLOCK_MONOTONIC reports %ld.%09ld seconds\n\n",
-     ts_end.tv_sec, ts_end.tv_nsec);
+    timespec_sub(&ts_end, &ts_start);
+    printf("CLOCK_MONOTONIC reports %ld.%09ld seconds\n\n", ts_end.tv_sec, ts_end.tv_nsec);
   
-  printf("start copying result\n");
-  dump(out_path,mapped_ddr_base+OUT_DATA_OFFSET);
-  printf("finish copying result\n\n");
-
+    printf("start copying result\n");
+    dpuGetResultFrom(output, mapped_ddr_base+OUT_DATA_OFFSET, OUT_DATA_SIZE);
+    double result[6] = {0,0,0,0,0,0};
+    for(int i = 0; i < OUT_DATA_SIZE; ++i){
+        result[i%6] += 0.01*(float)output[i] / 16 / (OUT_DATA_SIZE/6);
+    }
+    for(int i = 0; i < 6; ++i){
+        fprintf(outfile, "%f ", result[i]);
+    }
+    fprintf(outfile, "\n");
+    //dump(out_path,mapped_ddr_base+OUT_DATA_OFFSET);
+    printf("finish copying result\n\n");
+  }
+  fclose(outfile);
   printf("start unmapping memory\n");
   memory_unmap(1,mapped_reg_base);
   memory_unmap(128,mapped_ddr_base);
